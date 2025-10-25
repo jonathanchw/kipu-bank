@@ -53,8 +53,6 @@ contract KipuBank {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Occurs when a deposit exceeds the bank's global deposit limit.
-    /// @param amount Amount attempted to deposit.
-    /// @param remainingLimit Remaining deposit capacity of the bank.
     error KipuBankDepositLimitExceeded(uint256 amount, uint256 remainingLimit);
 
     /// @notice Occurs when a user attempts to withdraw more than their balance.
@@ -70,8 +68,7 @@ contract KipuBank {
     /// @notice Occurs when an ETH transfer fails during withdrawal.
     /// @param user Address attempting the withdrawal.
     /// @param amount Amount attempted to withdraw.
-    /// @param data Revert data returned from the failed call.
-    error KipuBankWithdrawalFailed(address user, uint256 amount, bytes data);
+    error KipuBankWithdrawalFailed(address user, uint256 amount);
 
     /// @notice Occurs when an ETH transfer fails in a private transfer function.
     /// @param errorData Revert data from the failed call.
@@ -80,6 +77,9 @@ contract KipuBank {
     /// @notice Occurs when a zero ETH deposit is attempted.
     error InvalidZeroDeposit();
 
+    /// @notice Occurs a reentrancy attack is detected.
+    error ReentrancyDetected();
+
     /*//////////////////////////////////////////////////////////////
                              MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -87,14 +87,19 @@ contract KipuBank {
     /// @notice Validates that the contract does not exceed the global deposit limit.
     /// @param _amount Amount of ETH being deposited.
     modifier validateCap(uint256 _amount) {
-        if (s_totalDeposited + _amount > i_bankCap)
-            revert KipuBankDepositLimitExceeded(_amount, i_bankCap - s_totalDeposited);
+        uint256 _totalDeposited = s_totalDeposited;
+        uint256 _bankCap = i_bankCap;
+        if (_totalDeposited + _amount > _bankCap)
+            revert KipuBankDepositLimitExceeded(
+                _amount,
+                _bankCap - _totalDeposited
+            );
         _;
     }
 
     /// @notice Prevents reentrancy attacks on sensitive functions.
     modifier reentrancyGuard() {
-        if (s_locked) revert("Reentrancy detected");
+        if (s_locked) revert ReentrancyDetected();
         s_locked = true;
         _;
         s_locked = false;
@@ -126,7 +131,7 @@ contract KipuBank {
         if (msg.value == 0) revert InvalidZeroDeposit();
         s_balances[msg.sender] += msg.value;
         s_totalDeposited += msg.value;
-        unchecked { ++s_totalDepositsCount; }
+        ++s_totalDepositsCount;
         emit KipuBankDeposit(msg.sender, msg.value);
     }
 
@@ -135,17 +140,14 @@ contract KipuBank {
      * @param _amount Amount of ETH to withdraw.
      */
     function withdraw(uint256 _amount) external reentrancyGuard {
-        uint256 userBalance = s_balances[msg.sender];
-        if (_amount > userBalance)
-            revert KipuBankInsufficientBalance(userBalance, _amount);
-        if (_amount > i_withdrawLimit)
-            revert KipuBankWithdrawalLimitExceeded(_amount, i_withdrawLimit);
-
-        s_balances[msg.sender] = userBalance - _amount;
-        unchecked { ++s_totalWithdrawalsCount; }
-
-        (bool success, bytes memory data) = msg.sender.call{value: _amount}("");
-        if (!success) revert KipuBankWithdrawalFailed(msg.sender, _amount, data);
+        uint256 _userBalance = s_balances[msg.sender];
+        _validateWithdraw(_amount, _userBalance);
+        unchecked {
+            s_balances[msg.sender] = _userBalance - _amount;
+        }
+        ++s_totalWithdrawalsCount;
+        (bool success, ) = msg.sender.call{value: _amount}("");
+        if (!success) revert KipuBankWithdrawalFailed(msg.sender, _amount);
 
         emit KipuBankWithdraw(msg.sender, _amount);
     }
@@ -153,15 +155,29 @@ contract KipuBank {
     /*//////////////////////////////////////////////////////////////
                              PRIVATE FUNCTIONS
     //////////////////////////////////////////////////////////////*/
-
     /**
-     * @notice Handles secure ETH transfers to a recipient.
-     * @param _recipient Address to receive ETH.
-     * @param _amount Amount of ETH to transfer.
+     * @notice Check if the amount to be withdraw is correct.
+     * @param _userBalance Balance of user.
+     * @param _amount Amount to be withdraw.
      */
-    function _transferEth(address payable _recipient, uint256 _amount) private {
-        (bool success, bytes memory data) = _recipient.call{value: _amount}("");
-        if (!success) revert KipuBankTransferFailed(data);
+    function _validateWithdraw(
+        uint256 _amount,
+        uint256 _userBalance
+    ) private view {
+        uint256 _withdrawLimit = i_withdrawLimit;
+        if (_amount > _userBalance)
+            revert KipuBankInsufficientBalance(_userBalance, _amount);
+        if (_amount > _withdrawLimit)
+            revert KipuBankWithdrawalLimitExceeded(_amount, _withdrawLimit);
+    }
+
+    /// @dev Internal function to process ETH deposits.
+    function _handleDeposit(address _sender, uint256 _amount) private {
+        if (_amount == 0) revert InvalidZeroDeposit();
+        s_balances[_sender] += _amount;
+        s_totalDeposited += _amount;
+        ++s_totalDepositsCount;
+        emit KipuBankDeposit(_sender, _amount);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -183,19 +199,11 @@ contract KipuBank {
 
     /// @notice Called when ETH is sent without data.
     receive() external payable validateCap(msg.value) {
-        if (msg.value == 0) revert InvalidZeroDeposit();
-        s_balances[msg.sender] += msg.value;
-        s_totalDeposited += msg.value;
-        unchecked { ++s_totalDepositsCount; }
-        emit KipuBankDeposit(msg.sender, msg.value);
+        _handleDeposit(msg.sender, msg.value);
     }
 
     /// @notice Called when ETH is sent with data or a function that does not exist is called.
     fallback() external payable validateCap(msg.value) {
-        if (msg.value == 0) return;
-        s_balances[msg.sender] += msg.value;
-        s_totalDeposited += msg.value;
-        unchecked { ++s_totalDepositsCount; }
-        emit KipuBankDeposit(msg.sender, msg.value);
+        _handleDeposit(msg.sender, msg.value);
     }
 }
